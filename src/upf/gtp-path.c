@@ -484,6 +484,9 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                  * for a configurable period after an UPF restart
                  * when the UPF receives a G-PDU not matching any PDRs.
                  */
+                ogs_warn("[DROP] No matching PDR TEID:0x%x QFI:%u from %s",
+                        header_desc.teid, header_desc.qos_flow_identifier,
+                        OGS_ADDR(&from, buf2));
                 if (ogs_time_ntp32_now() >
                        (ogs_pfcp_self()->local_recovery +
                         ogs_time_sec(ogs_local_conf()->time.message.pfcp.
