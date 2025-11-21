@@ -89,9 +89,16 @@ int ogs_ipfw_compile_rule(ogs_ipfw_rule_t *ipfw_rule, char *flow_description)
 
     av[i] = NULL;
 
-    /* "to assigned" --> "to any" */
+    /* "to|from assigned" --> "to|from any"
+     *
+     * When UEs advertise framed routes, traffic can legally use source
+     * addresses different from the PAA. Treat "assigned" as a wildcard
+     * so policy rules don't inadvertently drop that traffic.
+     */
     for (x = 2; av[x] != NULL; x++) {
-        if (strcmp(av[x], "assigned") == 0 && strcmp(av[x-1], "to") == 0) {
+        if (strcmp(av[x], "assigned") == 0 &&
+                (strcmp(av[x-1], "to") == 0 ||
+                 strcmp(av[x-1], "from") == 0)) {
             av[x] = "any";
             break;
         }
