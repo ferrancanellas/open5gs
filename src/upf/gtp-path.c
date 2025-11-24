@@ -587,8 +587,8 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
          * in such cases.
          */
         /* Disable UL source IP spoofing checks to allow any source (including
-         * framed routes or asymmetric paths). */
-        if (0 && pdr->src_if == OGS_PFCP_INTERFACE_ACCESS &&
+         * framed routes or asymmetric paths), but still determine subnet. */
+        if (pdr->src_if == OGS_PFCP_INTERFACE_ACCESS &&
             pdr->src_if_type_presence == true &&
             (pdr->src_if_type == OGS_PFCP_3GPP_INTERFACE_TYPE_N3_3GPP_ACCESS ||
              pdr->src_if_type == OGS_PFCP_3GPP_INTERFACE_TYPE_N9_FOR_ROAMING)) {
@@ -608,20 +608,7 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                 src_addr = (void *)&ip_h->ip_src.s_addr;
                 ogs_assert(src_addr);
 
-                if (src_addr[0] == sess->ipv4->addr[0]) {
-                    /* Source IP address should be matched in uplink */
-                } else if (check_framed_routes(sess, AF_INET, src_addr)) {
-                    /* Or source IP address should match a framed route */
-                } else {
-                    ogs_error("[DROP] Source IP-%d Spoofing APN:%s SrcIf:%d DstIf:%d TEID:0x%x",
-                                ip_h->ip_v, pdr->dnn, pdr->src_if, far->dst_if, header_desc.teid);
-                    ogs_error("       SRC:%08X, UE:%08X",
-                        be32toh(src_addr[0]), be32toh(sess->ipv4->addr[0]));
-                    ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
-
-                    goto cleanup;
-                }
-
+                /* Skip source-IP spoofing checks */
                 subnet = sess->ipv4->subnet;
                 eth_type = ETHERTYPE_IP;
 
@@ -661,37 +648,7 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
      *  - If the IP source address is the unspecified address, there is no
      *    source link-layer address option in the message.
      */
-                if (IN6_IS_ADDR_LINKLOCAL((struct in6_addr *)src_addr) &&
-                    src_addr[2] == sess->ipv6->addr[2] &&
-                    src_addr[3] == sess->ipv6->addr[3]) {
-                    /*
-                     * if Link-local address,
-                     * Interface Identifier should be matched
-                     */
-                } else if (src_addr[0] == sess->ipv6->addr[0] &&
-                            src_addr[1] == sess->ipv6->addr[1]) {
-                    /*
-                     * If Global address
-                     * 64 bit prefix should be matched
-                     */
-                } else if (check_framed_routes(sess, AF_INET6, src_addr)) {
-                    /* Or source IP address should match a framed route */
-                } else {
-                    ogs_error("[DROP] Source IP-%d Spoofing APN:%s SrcIf:%d DstIf:%d TEID:0x%x",
-                                ip_h->ip_v, pdr->dnn, pdr->src_if, far->dst_if, header_desc.teid);
-                    ogs_error("SRC:%08x %08x %08x %08x",
-                            be32toh(src_addr[0]), be32toh(src_addr[1]),
-                            be32toh(src_addr[2]), be32toh(src_addr[3]));
-                    ogs_error("UE:%08x %08x %08x %08x",
-                            be32toh(sess->ipv6->addr[0]),
-                            be32toh(sess->ipv6->addr[1]),
-                            be32toh(sess->ipv6->addr[2]),
-                            be32toh(sess->ipv6->addr[3]));
-                    ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
-
-                    goto cleanup;
-                }
-
+                /* Skip source-IP spoofing checks */
                 subnet = sess->ipv6->subnet;
                 eth_type = ETHERTYPE_IPV6;
 
