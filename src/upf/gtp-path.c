@@ -61,7 +61,8 @@ static ogs_pkbuf_pool_t *packet_pool = NULL;
 
 static void upf_gtp_handle_multicast(ogs_pkbuf_t *recvbuf);
 
-static int check_framed_routes(upf_sess_t *sess, int family, uint32_t *addr)
+__attribute__((unused)) static int check_framed_routes(
+        upf_sess_t *sess, int family, uint32_t *addr)
 {
     int i = 0;
     ogs_ipsubnet_t *routes = family == AF_INET ?
