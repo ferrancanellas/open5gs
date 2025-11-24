@@ -666,12 +666,20 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
             far->dst_if_type_presence == true &&
             far->dst_if_type == OGS_PFCP_3GPP_INTERFACE_TYPE_N6) {
 
+            /* If subnet was not determined above, pick it based on IP version */
             if (!subnet) {
-#if 0 /* It's redundant log message */
-                ogs_error("[DROP] Cannot find subnet V:%d, IPv4:%p, IPv6:%p",
-                        ip_h->ip_v, sess->ipv4, sess->ipv6);
-                ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
-#endif
+                if (ip_h->ip_v == 4 && sess->ipv4) {
+                    subnet = sess->ipv4->subnet;
+                    eth_type = ETHERTYPE_IP;
+                } else if (ip_h->ip_v == 6 && sess->ipv6) {
+                    subnet = sess->ipv6->subnet;
+                    eth_type = ETHERTYPE_IPV6;
+                }
+            }
+
+            if (!subnet) {
+                ogs_warn("[DROP] No subnet for UL packet TEID:0x%x IPver:%d",
+                        header_desc.teid, ip_h->ip_v);
                 goto cleanup;
             }
 
