@@ -586,7 +586,9 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
          * This is because IP source spoofing checks are performed only
          * in such cases.
          */
-        if (pdr->src_if == OGS_PFCP_INTERFACE_ACCESS &&
+        /* Disable UL source IP spoofing checks to allow any source (including
+         * framed routes or asymmetric paths). */
+        if (0 && pdr->src_if == OGS_PFCP_INTERFACE_ACCESS &&
             pdr->src_if_type_presence == true &&
             (pdr->src_if_type == OGS_PFCP_3GPP_INTERFACE_TYPE_N3_3GPP_ACCESS ||
              pdr->src_if_type == OGS_PFCP_3GPP_INTERFACE_TYPE_N9_FOR_ROAMING)) {
