@@ -1,0 +1,96 @@
+name: Build Open5GS images
+
+# This workflow is fork-specific and must never be contributed to upstream.
+# It lives only on the fork's main branch.
+#
+# Automatic trigger: push to main (builds the baseline image).
+# Manual trigger:    workflow_dispatch with a ref input (builds any branch or SHA
+#                    without requiring the workflow file to exist on that branch).
+#
+# All images are tagged with the exact commit SHA of the ref being built.
+# Never use a mutable tag (latest, branch name) in Kubernetes manifests.
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or SHA to build'
+        required: true
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Get exact commit SHA of checked-out ref
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The main open5gs Dockerfile (docker/build/Dockerfile) depends on a
+      # pre-built base image that provides the Ubuntu build toolchain.
+      # We build and push it first, tagged as both :latest and :<sha>.
+      # The main build resolves the base via the :latest tag (Docker default
+      # when no tag is specified in the FROM argument).
+      - name: Build and push Ubuntu build base
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/ubuntu/latest/base/Dockerfile
+          build-args: |
+            dist=ubuntu
+            tag=24.04
+          push: true
+          tags: |
+            ghcr.io/ferrancanellas/ubuntu-24.04-open5gs-base:latest
+            ghcr.io/ferrancanellas/ubuntu-24.04-open5gs-base:${{ steps.sha.outputs.sha }}
+          cache-from: type=gha,scope=base
+          cache-to: type=gha,mode=max,scope=base
+
+      # Monolithic open5gs image: all NF binaries in one image.
+      # The NF to run is selected by the Deployment args in Kubernetes
+      # (e.g. args: ["open5gs-nrfd"], args: ["open5gs-amfd"]).
+      - name: Build and push open5gs image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/build/Dockerfile
+          build-args: |
+            username=ghcr.io/ferrancanellas
+            dist=ubuntu
+            tag=24.04
+          push: true
+          tags: ghcr.io/ferrancanellas/open5gs:${{ steps.sha.outputs.sha }}
+          cache-from: type=gha,scope=open5gs
+          cache-to: type=gha,mode=max,scope=open5gs
+
+      - name: Build and push open5gs-webui image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/webui/Dockerfile
+          push: true
+          tags: ghcr.io/ferrancanellas/open5gs-webui:${{ steps.sha.outputs.sha }}
+          cache-from: type=gha,scope=webui
+          cache-to: type=gha,mode=max,scope=webui
