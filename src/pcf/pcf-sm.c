@@ -192,8 +192,17 @@ void pcf_state_operational(ogs_fsm_t *s, pcf_event_t *e)
             CASE(OGS_SBI_RESOURCE_NAME_SM_POLICIES)
                 if (!message.h.resource.component[1]) {
                     if (message.SmPolicyContextData &&
-                        message.SmPolicyContextData->supi &&
-                        message.SmPolicyContextData->pdu_session_id) {
+                        message.SmPolicyContextData->supi) {
+
+                        if (ogs_pdu_session_id_is_valid(
+                                message.SmPolicyContextData->
+                                    pdu_session_id) == false) {
+                            ogs_error("[%s:%d] Invalid PDU session identity",
+                                    message.SmPolicyContextData->supi,
+                                    message.SmPolicyContextData->
+                                        pdu_session_id);
+                            break;
+                        }
 
                         pcf_ue_sm = pcf_ue_sm_find_by_supi(
                                     message.SmPolicyContextData->supi);
@@ -488,10 +497,19 @@ void pcf_state_operational(ogs_fsm_t *s, pcf_event_t *e)
                     ogs_assert(pcf_ue_am_id >= OGS_MIN_POOL_ID &&
                             pcf_ue_am_id <= OGS_MAX_POOL_ID);
 
+                    /*
+                     * The AM policy FSM expects a stream ID in e->h.sbi.data,
+                     * but the SBI client event initially carries a UDR
+                     * transaction ID. Without a valid association, clear it
+                     * to prevent an unrelated stream from being selected.
+                     */
                     if (sbi_xact->assoc_stream_id >= OGS_MIN_POOL_ID &&
                         sbi_xact->assoc_stream_id <= OGS_MAX_POOL_ID)
                         e->h.sbi.data =
                             OGS_UINT_TO_POINTER(sbi_xact->assoc_stream_id);
+                    else
+                        e->h.sbi.data =
+                            OGS_UINT_TO_POINTER(OGS_INVALID_POOL_ID);
 
                     ogs_sbi_xact_remove(sbi_xact);
 
@@ -532,10 +550,18 @@ void pcf_state_operational(ogs_fsm_t *s, pcf_event_t *e)
                     ogs_assert(sess_id >= OGS_MIN_POOL_ID &&
                             sess_id <= OGS_MAX_POOL_ID);
 
+                    /*
+                     * The SM policy FSM also interprets this field as a
+                     * stream ID. Do not leave the UDR transaction ID when
+                     * there is no valid stream association.
+                     */
                     if (sbi_xact->assoc_stream_id >= OGS_MIN_POOL_ID &&
                         sbi_xact->assoc_stream_id <= OGS_MAX_POOL_ID)
                         e->h.sbi.data =
                             OGS_UINT_TO_POINTER(sbi_xact->assoc_stream_id);
+                    else
+                        e->h.sbi.data =
+                            OGS_UINT_TO_POINTER(OGS_INVALID_POOL_ID);
 
                     ogs_sbi_xact_remove(sbi_xact);
 
@@ -594,10 +620,19 @@ void pcf_state_operational(ogs_fsm_t *s, pcf_event_t *e)
                 ogs_assert(sess_id >= OGS_MIN_POOL_ID &&
                         sess_id <= OGS_MAX_POOL_ID);
 
+                /*
+                 * The BSF response also arrives with a transaction ID.
+                 * Clear the event data if no originating stream is
+                 * associated, so the policy FSM cannot use that ID
+                 * to look up an unrelated stream.
+                 */
                 if (sbi_xact->assoc_stream_id >= OGS_MIN_POOL_ID &&
                     sbi_xact->assoc_stream_id <= OGS_MAX_POOL_ID)
                     e->h.sbi.data = OGS_UINT_TO_POINTER(
                             sbi_xact->assoc_stream_id);
+                else
+                    e->h.sbi.data =
+                        OGS_UINT_TO_POINTER(OGS_INVALID_POOL_ID);
 
                 ogs_sbi_xact_remove(sbi_xact);
 

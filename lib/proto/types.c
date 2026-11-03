@@ -492,6 +492,26 @@ bool ogs_pdu_session_id_is_valid(int psi)
            psi <= OGS_NAS_PDU_SESSION_IDENTITY_MAX;
 }
 
+int ogs_pdu_session_id_from_string(const char *str)
+{
+    int psi = OGS_NAS_PDU_SESSION_IDENTITY_UNASSIGNED;
+
+    if (!str || !*str)
+        return OGS_NAS_PDU_SESSION_IDENTITY_UNASSIGNED;
+
+    for (; *str; str++) {
+        if (*str < '0' || *str > '9')
+            return OGS_NAS_PDU_SESSION_IDENTITY_UNASSIGNED;
+
+        /* Bound each step so even an arbitrarily long input cannot overflow. */
+        psi = psi * 10 + (*str - '0');
+        if (psi > OGS_NAS_PDU_SESSION_IDENTITY_MAX)
+            return OGS_NAS_PDU_SESSION_IDENTITY_UNASSIGNED;
+    }
+
+    return psi;
+}
+
 /*
  * ogs_bcd_to_buffer() only converts bytes. It does not validate that
  * the input is a bounded decimal IMSI string, so check it first.
@@ -1171,6 +1191,32 @@ void ogs_ims_data_free(ogs_ims_data_t *ims_data)
             }
         }
     }
+}
+
+/*
+ * TS29.214 4.4.5, TS29.514 4.2.6.7
+ * Subscription to Notification of Signalling Path Status
+ *
+ * Media component number 0 with a single AF signalling sub-component
+ * whose flow number is 0. The rest of the attributes shall not be used,
+ * and the PCC rules for AF signalling are expected to be provisioned
+ * already, so no PCC rule is derived from this media component.
+ */
+bool ogs_media_is_signalling_path_status(
+        ogs_media_component_t *media_component)
+{
+    ogs_media_sub_component_t *sub = NULL;
+
+    ogs_assert(media_component);
+
+    if (media_component->media_component_number != 0 ||
+        media_component->num_of_sub != 1)
+        return false;
+
+    sub = &media_component->sub[0];
+
+    return sub->flow_number == 0 &&
+        sub->flow_usage == OGS_FLOW_USAGE_AF_SIGNALLING;
 }
 
 static int flow_rx_to_gx(ogs_flow_t *rx_flow, ogs_flow_t *gx_flow)

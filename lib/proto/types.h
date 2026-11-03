@@ -153,6 +153,8 @@ extern "C" {
 #define OGS_NAS_PDU_SESSION_IDENTITY_MAX 255
 
 bool ogs_pdu_session_id_is_valid(int psi);
+/* Return unassigned for malformed or out-of-range decimal input. */
+int ogs_pdu_session_id_from_string(const char *str);
 
 #define OGS_ACCESS_TYPE_3GPP 1
 #define OGS_ACCESS_TYPE_NON_3GPP 2
@@ -1231,6 +1233,9 @@ typedef struct ogs_ims_data_s {
 } ogs_ims_data_t;
 
 void ogs_ims_data_free(ogs_ims_data_t *ims_data);
+
+bool ogs_media_is_signalling_path_status(
+        ogs_media_component_t *media_component);
 
 int ogs_pcc_rule_num_of_flow_equal_to_media(
         ogs_pcc_rule_t *pcc_rule, ogs_media_component_t *media_component);
