@@ -32,6 +32,7 @@ RUN apt-get update && \
         libtalloc-dev \
         libc-ares-dev \
         iproute2 \
+        nftables \
         ca-certificates \
         netbase \
         pkg-config && \

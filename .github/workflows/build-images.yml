@@ -34,6 +34,14 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
 
+      # Keep the fork's runtime tooling when building an older upstream ref.
+      # Only the base definition comes from the workflow revision; Open5GS
+      # itself is still built from the exact ref checked out above.
+      - name: Read fork-maintained base image definition
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: git show "$WORKFLOW_SHA:docker/ubuntu/latest/base/Dockerfile" > "$RUNNER_TEMP/open5gs-base.Dockerfile"
+
       - name: Get exact commit SHA of checked-out ref
         id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
@@ -57,7 +65,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: docker/ubuntu/latest/base/Dockerfile
+          file: ${{ runner.temp }}/open5gs-base.Dockerfile
           build-args: |
             dist=ubuntu
             tag=24.04
@@ -94,3 +102,13 @@ jobs:
           tags: ghcr.io/ferrancanellas/open5gs-webui:${{ steps.sha.outputs.sha }}
           cache-from: type=gha,scope=webui
           cache-to: type=gha,mode=max,scope=webui
+
+      - name: Verify Open5GS image tools
+        env:
+          IMAGE: ghcr.io/ferrancanellas/open5gs:${{ steps.sha.outputs.sha }}
+        run: |
+          docker run --rm --entrypoint /bin/sh "$IMAGE" -ec '
+            command -v open5gs-upfd
+            command -v ip
+            nft --version
+          '
