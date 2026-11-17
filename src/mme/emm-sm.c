@@ -77,6 +77,7 @@ void emm_state_de_registered(ogs_fsm_t *s, mme_event_t *e)
 
     switch (e->id) {
     case OGS_FSM_ENTRY_SIG:
+        mme_ue_unpublish_next_guti(mme_ue);
         CLEAR_SERVICE_INDICATOR(mme_ue);
         CLEAR_MME_UE_ALL_TIMERS(mme_ue);
         break;
@@ -438,6 +439,18 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
                 break;
             }
 
+            /*
+             * TS 24.301 5.4.4.2: the MME sends IDENTITY REQUEST only for a
+             * UE whose IMSI it does not have.  A response from a UE whose
+             * IMSI is known answers no request (7.4); ignore it instead of
+             * relabelling this context with the IMSI in the message.
+             */
+            if (MME_UE_HAVE_IMSI(mme_ue)) {
+                ogs_error("[%s] Unexpected Identity response",
+                        mme_ue->imsi_bcd);
+                break;
+            }
+
             ogs_info("Identity response");
             CLEAR_MME_UE_TIMER(mme_ue->t3470);
 
@@ -779,6 +792,26 @@ static void common_register_state(ogs_fsm_t *s, mme_event_t *e,
             }
 
             /*
+             * An Extended Service Request for CS fallback needs an active
+             * EPS bearer: the idle branch below builds an
+             * INITIAL CONTEXT SETUP REQUEST, whose mandatory E-RAB list is
+             * empty when every bearer is inactive (for example after the UE
+             * rejected the default bearer activation in ATTACH COMPLETE).
+             * The Service Request and TAU branches already reject this
+             * state; do the same here instead of letting the S1AP builder
+             * fail and asserting on its return value.
+             */
+            if (!ACTIVE_EPS_BEARERS_IS_AVAIABLE(mme_ue)) {
+                ogs_error("No active EPS bearers : IMSI[%s]", mme_ue->imsi_bcd);
+                r = nas_eps_send_service_reject(enb_ue, mme_ue,
+                        OGS_NAS_EMM_CAUSE_NO_EPS_BEARER_CONTEXT_ACTIVATED);
+                ogs_expect(r == OGS_OK);
+                ogs_assert(r != OGS_ERROR);
+                MME_RESTORE_CONTEXT_ON_FAILURE(mme_ue, s);
+                break;
+            }
+
+            /*
              * If the OLD ENB_UE is being maintained in MME-UE Context,
              * it deletes the S1 Context after exchanging
              * the UEContextReleaseCommand/Complete with the eNB
@@ -1106,6 +1139,20 @@ void emm_state_authentication(ogs_fsm_t *s, mme_event_t *e)
                 break;
             }
 
+            /*
+             * Another context with this IMSI, which mme_ue_set_imsi() left
+             * alone, is released into this one now that the UE is
+             * authenticated.
+             */
+            if (mme_ue_find_by_imsi(mme_ue->imsi, mme_ue->imsi_len) !=
+                    mme_ue) {
+                char imsi_bcd[OGS_MAX_IMSI_BCD_LEN+1];
+
+                ogs_cpystrn(imsi_bcd, mme_ue->imsi_bcd, sizeof(imsi_bcd));
+                mme_ue_set_imsi(mme_ue, imsi_bcd,
+                        MME_UE_IMSI_FROM_AUTHENTICATION_RESPONSE);
+            }
+
             OGS_FSM_TRAN(&mme_ue->sm, &emm_state_security_mode);
             break;
         case OGS_NAS_EPS_AUTHENTICATION_FAILURE:
@@ -1345,6 +1392,13 @@ void emm_state_security_mode(ogs_fsm_t *s, mme_event_t *e)
             h.type = e->nas_type;
             if (h.integrity_protected == 0) {
                 ogs_error("[%s] No Integrity Protected", mme_ue->imsi_bcd);
+                break;
+            }
+
+            /* TS 24.301 4.4.5: discard an unciphered message that shall
+             * have been ciphered, as this one is (5.4.3.3), with EEA0 too. */
+            if (h.ciphered == 0) {
+                ogs_error("[%s] Not Ciphered", mme_ue->imsi_bcd);
                 break;
             }
 
@@ -1853,6 +1907,13 @@ void emm_state_initial_context_setup(ogs_fsm_t *s, mme_event_t *e)
                     ogs_pkbuf_free(emmbuf);
                     return;
                 }
+                emmbuf = nas_eps_security_protect(mme_ue,
+                    OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_CIPHERED,
+                    emmbuf);
+                if (!emmbuf) {
+                    ogs_error("nas_eps_security_protect() failed");
+                    return;
+                }
 
                 ogs_timer_start(mme_ue->t3450.timer,
                         mme_timer_cfg(MME_TIMER_T3450)->duration);
@@ -1861,6 +1922,10 @@ void emm_state_initial_context_setup(ogs_fsm_t *s, mme_event_t *e)
                         enb_ue_find_by_id(mme_ue->enb_ue_id), emmbuf);
                 ogs_expect(r == OGS_OK);
                 ogs_assert(r != OGS_ERROR);
+                if (r == OGS_OK &&
+                    mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST &&
+                    MME_NEXT_GUTI_IS_AVAILABLE(mme_ue))
+                    mme_ue_publish_next_guti(mme_ue);
             }
             break;
         default:
@@ -1934,6 +1999,7 @@ void emm_state_exception(ogs_fsm_t *s, mme_event_t *e)
 
     switch (e->id) {
     case OGS_FSM_ENTRY_SIG:
+        mme_ue_unpublish_next_guti(mme_ue);
         CLEAR_SERVICE_INDICATOR(mme_ue);
         CLEAR_MME_UE_ALL_TIMERS(mme_ue);
         break;

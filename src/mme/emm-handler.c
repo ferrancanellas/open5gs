@@ -257,6 +257,19 @@ int emm_handle_attach_request(enb_ue_t *enb_ue, mme_ue_t *mme_ue,
                 sizeof(attach_request->ue_additional_security_capability));
     }
 
+    /* TS 24.301 5.5.1.2.7 j): no EPS encryption algorithm (all bits zero) */
+    if (mme_ue->ue_network_capability.eea == 0) {
+        ogs_warn("[UE:0x%x:0x%x] No EPS encryption algorithm",
+            mme_ue->ue_network_capability.eea,
+            mme_ue->ue_network_capability.eia);
+        r = nas_eps_send_attach_reject(enb_ue, mme_ue,
+                OGS_NAS_EMM_CAUSE_UE_SECURITY_CAPABILITIES_MISMATCH,
+                OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
+        return OGS_ERROR;
+    }
+
     if (mme_selected_int_algorithm(mme_ue) ==
             OGS_NAS_SECURITY_ALGORITHMS_EIA0) {
         ogs_warn("Encrypt[0x%x] can be skipped with EEA0, "
@@ -333,6 +346,9 @@ int emm_handle_attach_complete(
 {
     int r, rv;
     ogs_pkbuf_t *emmbuf = NULL;
+    ogs_nas_esm_message_container_t *esm_message_container =
+        &attach_complete->esm_message_container;
+    const ogs_nas_esm_header_t *esm_header = NULL;
 
     ogs_nas_eps_message_t message;
     ogs_nas_eps_emm_information_t *emm_information =
@@ -364,11 +380,26 @@ int emm_handle_attach_complete(
         local.tm_hour, local.tm_min, local.tm_sec,
         (int)local.tm_gmtoff, local.tm_isdst);
 
-    rv = nas_eps_send_emm_to_esm(
-            mme_ue, &attach_complete->esm_message_container);
-    if (rv != OGS_OK) {
-        ogs_error("nas_eps_send_emm_to_esm() failed");
+    if (esm_message_container->length < sizeof(*esm_header)) {
+        ogs_error("Invalid ESM Message Container length[%d]",
+                esm_message_container->length);
         return OGS_ERROR;
+    }
+
+    /* Only forward the default bearer activation response from Attach Complete. */
+    esm_header = (const ogs_nas_esm_header_t *)esm_message_container->buffer;
+    if (esm_header->message_type ==
+            OGS_NAS_EPS_ACTIVATE_DEFAULT_EPS_BEARER_CONTEXT_ACCEPT ||
+        esm_header->message_type ==
+            OGS_NAS_EPS_ACTIVATE_DEFAULT_EPS_BEARER_CONTEXT_REJECT) {
+        rv = nas_eps_send_emm_to_esm(mme_ue, esm_message_container);
+        if (rv != OGS_OK) {
+            ogs_error("nas_eps_send_emm_to_esm() failed");
+            return OGS_ERROR;
+        }
+    } else {
+        ogs_error("[%s] Unexpected ESM message in Attach Complete [%d]",
+                mme_ue->imsi_bcd, esm_header->message_type);
     }
 
     memset(&message, 0, sizeof(message));

@@ -296,11 +296,19 @@ int ogs_nas_parse_nssai(
     while (pos < nas_nssai->length &&
             num_of_nas_s_nssai_ie < OGS_MAX_NUM_OF_SLICE) {
 
+        if (pos + 1 + nas_nssai->buffer[pos] > nas_nssai->length) {
+            ogs_error("Truncated S-NSSAI [pos:%d len:%d length:%d]",
+                    pos, nas_nssai->buffer[pos], nas_nssai->length);
+            ogs_log_hexdump(OGS_ERROR, nas_nssai->buffer, nas_nssai->length);
+            break;
+        }
+
         len = ogs_nas_parse_s_nssai(nas_s_nssai_ie + num_of_nas_s_nssai_ie,
                 (ogs_nas_s_nssai_t *)(nas_nssai->buffer + pos));
         if (len == 0) {
             ogs_error("Cannot parse NSSAI [%d]", nas_nssai->length);
             ogs_log_hexdump(OGS_ERROR, nas_nssai->buffer, nas_nssai->length);
+            break;
         }
 
         pos += len;
@@ -945,6 +953,14 @@ static int parse_qos_rules_packet_filter_list(
                     buffer+size+len,
                     sizeof(rule->pf[i].content.component[j].ipv6.prefixlen));
                 len += sizeof(rule->pf[i].content.component[j].ipv6.prefixlen);
+
+                if (rule->pf[i].content.component[j].ipv6.prefixlen >
+                        OGS_IPV6_128_PREFIX_LEN) {
+                    ogs_error("RuleId[%u] PF[%d] Invalid IPv6 prefix "
+                            "length[%d]", rule->identifier, i,
+                            rule->pf[i].content.component[j].ipv6.prefixlen);
+                    goto cleanup;
+                }
                 break;
             case OGS_PACKET_FILTER_IPV6_LOCAL_ADDRESS_TYPE:
             case OGS_PACKET_FILTER_IPV6_REMOTE_ADDRESS_TYPE:

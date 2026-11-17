@@ -25,18 +25,37 @@
 ogs_pkbuf_t *nas_eps_security_encode(
         mme_ue_t *mme_ue, ogs_nas_eps_message_t *message)
 {
-    int integrity_protected = 0;
-    int new_security_context = 0;
-    int ciphered = 0;
-    ogs_nas_eps_security_header_t h;
     ogs_pkbuf_t *new = NULL;
 
-    ogs_assert(mme_ue);
     ogs_assert(message);
 
-    switch (message->h.security_header_type) {
+    new = ogs_nas_eps_plain_encode(message);
+    if (!new) {
+        ogs_error("ogs_nas_eps_plain_encode() failed");
+        return NULL;
+    }
+
+    return nas_eps_security_protect(
+            mme_ue, message->h.security_header_type, new);
+}
+
+/*
+ * TS 24.301 4.4.3.1: the NAS COUNT is increased after each new or retransmitted
+ * message, so a timer keeps the plain message and each sending protects it.
+ */
+ogs_pkbuf_t *nas_eps_security_protect(mme_ue_t *mme_ue,
+        uint8_t security_header_type, ogs_pkbuf_t *new)
+{
+    int integrity_protected = 0;
+    int ciphered = 0;
+    ogs_nas_eps_security_header_t h;
+
+    ogs_assert(mme_ue);
+    ogs_assert(new);
+
+    switch (security_header_type) {
     case OGS_NAS_SECURITY_HEADER_PLAIN_NAS_MESSAGE:
-        return ogs_nas_eps_plain_encode(message);
+        return new;
     case OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED:
         integrity_protected = 1;
         break;
@@ -46,23 +65,16 @@ ogs_pkbuf_t *nas_eps_security_encode(
         break;
     case OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_NEW_SECURITY_CONTEXT:
         integrity_protected = 1;
-        new_security_context = 1;
         break;
     case OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_CIPHTERD_WITH_NEW_INTEGRITY_CONTEXT:
         integrity_protected = 1;
-        new_security_context = 1;
         ciphered = 1;
         break;
     default:
         ogs_error("Not implemented(securiry header type:0x%x)", 
-                message->h.security_header_type);
+                security_header_type);
+        ogs_pkbuf_free(new);
         return NULL;
-    }
-
-    if (new_security_context) {
-        mme_ue->dl_count = 0;
-        mme_ue->ul_count.i32 = 0;
-        mme_ue->ul_count_accepted = false;
     }
 
     if (mme_ue->selected_enc_algorithm == 0)
@@ -71,15 +83,9 @@ ogs_pkbuf_t *nas_eps_security_encode(
         integrity_protected = 0;
 
     memset(&h, 0, sizeof(h));
-    h.security_header_type = message->h.security_header_type;
-    h.protocol_discriminator = message->h.protocol_discriminator;
+    h.security_header_type = security_header_type;
+    h.protocol_discriminator = OGS_NAS_PROTOCOL_DISCRIMINATOR_EMM;
     h.sequence_number = (mme_ue->dl_count & 0xff);
-
-    new = ogs_nas_eps_plain_encode(message);
-    if (!new) {
-        ogs_error("ogs_nas_eps_plain_encode() failed");
-        return NULL;
-    }
 
     if (ciphered) {
         /* encrypt NAS message */
@@ -117,9 +123,14 @@ ogs_pkbuf_t *nas_eps_security_encode(
 int nas_eps_security_decode(mme_ue_t *mme_ue, 
     ogs_nas_security_header_type_t security_header_type, ogs_pkbuf_t *pkbuf)
 {
+    bool ciphered = security_header_type.ciphered;
+
     ogs_assert(mme_ue);
     ogs_assert(pkbuf);
     ogs_assert(pkbuf->data);
+
+    /* TS24.301 4.4.4.3: a failed check discards this message only */
+    mme_ue->mac_failed = 0;
 
     if (security_header_type.service_request) {
 #define SHORT_MAC_SIZE 2
@@ -130,6 +141,18 @@ int nas_eps_security_decode(mme_ue_t *mme_ue,
         uint8_t sequence_number_high_3bit;
         uint8_t mac[NAS_SECURITY_MAC_SIZE];
         uint32_t estimated_ul_count = 0;
+
+        /*
+         * A SERVICE REQUEST carries the security header, the KSI and
+         * sequence number, and the two-octet short MAC (TS 24.301
+         * Table 8.2.25.1). A shorter NAS PDU cannot be decoded; discard it
+         * instead of reading and appending its missing MAC in place.
+         */
+        if (pkbuf->len < 1 + 1 + SHORT_MAC_SIZE) {
+            ogs_error("NAS SERVICE REQUEST too short [%d]",
+                    (int)pkbuf->len);
+            return OGS_ERROR;
+        }
 
         if (mme_ue->selected_int_algorithm == 0) {
             ogs_warn("integrity algorithm is not defined");
@@ -244,6 +267,14 @@ int nas_eps_security_decode(mme_ue_t *mme_ue,
             if (h->message_authentication_code != mac32) {
                 ogs_warn("NAS MAC verification failed(0x%x != 0x%x)",
                     be32toh(h->message_authentication_code), be32toh(mac32));
+
+                /*
+                 * TS24.301 4.4.4.3: a ciphered message (with EEA0 too,
+                 * 4.4.5) that fails the integrity check is discarded
+                 */
+                if (ciphered)
+                    return OGS_ERROR;
+
                 mme_ue->mac_failed = 1;
             } else {
                 /*

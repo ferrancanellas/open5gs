@@ -109,6 +109,8 @@ void gmm_state_de_registered(ogs_fsm_t *s, amf_event_t *e)
 
     switch (e->h.id) {
     case OGS_FSM_ENTRY_SIG:
+        /* De-registration ends any registration awaiting Complete. */
+        amf_ue_unpublish_next_guti(amf_ue);
         AMF_UE_CLEAR_PAGING_INFO(amf_ue);
         AMF_UE_CLEAR_N2_TRANSFER(amf_ue, pdu_session_resource_setup_request);
         AMF_UE_CLEAR_5GSM_MESSAGE(amf_ue);
@@ -1783,7 +1785,7 @@ static void common_register_state(ogs_fsm_t *s, amf_event_t *e,
                 break;
             }
 
-            if (!AMF_UE_HAVE_SUCI(amf_ue)) {
+            if (!(AMF_UE_HAVE_SUCI(amf_ue) || AMF_UE_HAVE_SUPI(amf_ue))) {
                 CLEAR_AMF_UE_TIMER(amf_ue->t3570);
                 r = nas_5gs_send_identity_request(amf_ue);
                 ogs_expect(r == OGS_OK);
@@ -1956,6 +1958,18 @@ static void common_register_state(ogs_fsm_t *s, amf_event_t *e,
                 break;
             }
 
+            /*
+             * TS 24.501 5.4.3.2: the AMF sends IDENTITY REQUEST only for a
+             * UE whose SUCI and SUPI it does not have.  A response from a
+             * UE with either answers no request (7.4); ignore it instead of
+             * relabelling this context with the SUCI in the message.
+             */
+            if (AMF_UE_HAVE_SUCI(amf_ue) || AMF_UE_HAVE_SUPI(amf_ue)) {
+                ogs_error("[%s] Unexpected Identity response",
+                        amf_ue->suci ? amf_ue->suci : amf_ue->supi);
+                break;
+            }
+
             CLEAR_AMF_UE_TIMER(amf_ue->t3570);
 
             ogs_info("Identity response");
@@ -2010,6 +2024,13 @@ static void common_register_state(ogs_fsm_t *s, amf_event_t *e,
                 ogs_expect(r == OGS_OK);
                 ogs_assert(r != OGS_ERROR);
             }
+
+            /*
+             * Another context with this SUCI moves its sessions here once
+             * the SUPI is confirmed (amf_ue_set_supi()); release them after
+             * the authentication.
+             */
+            amf_ue->registration_session_release_after_authentication = true;
 
             OGS_FSM_TRAN(s, &gmm_state_authentication);
             break;
@@ -2857,6 +2878,13 @@ void gmm_state_security_mode(ogs_fsm_t *s, amf_event_t *e)
                 break;
             }
 
+            /* TS 24.501 4.4.5: discard an unciphered message that shall
+             * have been ciphered, as this one is (5.4.2.3), with 5G-EA0 too. */
+            if (h.ciphered == 0) {
+                ogs_error("[%s] Security-mode : Not Ciphered", amf_ue->supi);
+                break;
+            }
+
             if (!SECURITY_CONTEXT_IS_VALID(amf_ue)) {
                 ogs_error("[%s] No Security Context", amf_ue->supi);
                 break;
@@ -3117,6 +3145,29 @@ void gmm_state_security_mode(ogs_fsm_t *s, amf_event_t *e)
             END
             break;
 
+        case OpenAPI_service_name_nudm_uecm:
+            SWITCH(sbi_message->h.resource.component[1])
+            CASE(OGS_SBI_RESOURCE_NAME_REGISTRATIONS)
+                SWITCH(sbi_message->h.method)
+                CASE(OGS_SBI_HTTP_METHOD_PATCH)
+                    /* Purge from a deregistration that the new
+                     * registration has overtaken */
+                    ogs_error("[%s] Ignore SBI message", amf_ue->supi);
+                    break;
+                DEFAULT
+                    ogs_error("[%s] Invalid HTTP method [%s]",
+                            amf_ue->suci, sbi_message->h.method);
+                    ogs_assert_if_reached();
+                END
+                break;
+
+            DEFAULT
+                ogs_error("Invalid resource name [%s]",
+                        sbi_message->h.resource.component[1]);
+                ogs_assert_if_reached();
+            END
+            break;
+
         default:
             ogs_error("Invalid service name [%s]", sbi_message->h.service.name);
             ogs_assert_if_reached();
@@ -3266,28 +3317,36 @@ void gmm_state_initial_context_setup(ogs_fsm_t *s, amf_event_t *e)
 
             SWITCH(sbi_message->h.resource.component[1])
             CASE(OGS_SBI_RESOURCE_NAME_REGISTRATIONS)
-                if (sbi_message->res_status != OGS_SBI_HTTP_STATUS_CREATED &&
-                    sbi_message->res_status != OGS_SBI_HTTP_STATUS_NO_CONTENT &&
-                    sbi_message->res_status != OGS_SBI_HTTP_STATUS_OK) {
-                    ogs_error("[%s] HTTP response error [%d]",
-                            amf_ue->supi, sbi_message->res_status);
-                    r = nas_5gs_send_gmm_reject(
-                            ran_ue_find_by_id(amf_ue->ran_ue_id), amf_ue,
-                            OGS_5GMM_CAUSE_5GS_SERVICES_NOT_ALLOWED);
-                    ogs_expect(r == OGS_OK);
-                    ogs_assert(r != OGS_ERROR);
-                    OGS_FSM_TRAN(&amf_ue->sm, &gmm_state_exception);
-                    break;
-                }
-
                 SWITCH(sbi_message->h.method)
                 CASE(OGS_SBI_HTTP_METHOD_PUT)
+                    if (sbi_message->res_status !=
+                            OGS_SBI_HTTP_STATUS_CREATED &&
+                        sbi_message->res_status !=
+                            OGS_SBI_HTTP_STATUS_NO_CONTENT &&
+                        sbi_message->res_status != OGS_SBI_HTTP_STATUS_OK) {
+                        ogs_error("[%s] HTTP response error [%d]",
+                                amf_ue->supi, sbi_message->res_status);
+                        r = nas_5gs_send_gmm_reject(
+                                ran_ue_find_by_id(amf_ue->ran_ue_id), amf_ue,
+                                OGS_5GMM_CAUSE_5GS_SERVICES_NOT_ALLOWED);
+                        ogs_expect(r == OGS_OK);
+                        ogs_assert(r != OGS_ERROR);
+                        OGS_FSM_TRAN(&amf_ue->sm, &gmm_state_exception);
+                        break;
+                    }
+
                     r = amf_ue_sbi_discover_and_send(
                             OpenAPI_service_name_nudm_sdm, NULL,
                             amf_nudm_sdm_build_get_datasets,
                             amf_ue, state, NULL);
                     ogs_expect(r == OGS_OK);
                     ogs_assert(r != OGS_ERROR);
+                    break;
+
+                CASE(OGS_SBI_HTTP_METHOD_PATCH)
+                    /* Purge from a deregistration that the new
+                     * registration has overtaken */
+                    ogs_error("[%s] Ignore SBI message", amf_ue->supi);
                     break;
 
                 DEFAULT
@@ -3880,7 +3939,7 @@ void gmm_state_exception(ogs_fsm_t *s, amf_event_t *e)
                 break;
             }
 
-            if (!AMF_UE_HAVE_SUCI(amf_ue)) {
+            if (!(AMF_UE_HAVE_SUCI(amf_ue) || AMF_UE_HAVE_SUPI(amf_ue))) {
                 CLEAR_AMF_UE_TIMER(amf_ue->t3570);
                 r = nas_5gs_send_identity_request(amf_ue);
                 ogs_expect(r == OGS_OK);

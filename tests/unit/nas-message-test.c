@@ -18,6 +18,7 @@
  */
 
 #include "ogs-nas-eps.h"
+#include "ogs-nas-5gs.h"
 #include "core/abts.h"
 
 static void ogs_nas_eps_message_test1(abts_case *tc, void *data)
@@ -580,11 +581,120 @@ static void imeisv_conversion_test(abts_case *tc, void *data)
     ABTS_INT_EQUAL(tc, 0xa5, output.guard);
 }
 
+static void ogs_nas_5gs_qos_rules_prefix_length_test(abts_case *tc, void *data)
+{
+    ogs_nas_qos_rule_t rule[OGS_NAS_MAX_NUM_OF_QOS_RULE];
+    ogs_nas_qos_rules_t rules;
+    uint8_t buffer[64];
+    unsigned int i, n = 0;
+    ogs_log_level_e level = ogs_log_get_domain_level(__ogs_nas_domain);
+
+    /* Create new QoS rule, one bi-directional packet filter whose only
+     * component is an IPv6 local address/prefix length. */
+    buffer[n++] = 1; /* QoS rule identifier */
+    buffer[n++] = 0;
+    buffer[n++] = 1 + 1 + 1 + (1 + OGS_IPV6_LEN + 1) + 1 + 1;
+    buffer[n++] = (OGS_NAS_QOS_CODE_CREATE_NEW_QOS_RULE << 5) | (1 << 4) | 1;
+    buffer[n++] = (OGS_NAS_QOS_DIRECTION_BIDIRECTIONAL << 4) | 0;
+    buffer[n++] = 1 + OGS_IPV6_LEN + 1; /* Length of packet filter contents */
+    buffer[n++] = OGS_PACKET_FILTER_IPV6_LOCAL_ADDRESS_PREFIX_LENGTH_TYPE;
+    for (i = 0; i < OGS_IPV6_LEN; i++)
+        buffer[n++] = 0x20 + i;
+    buffer[n++] = OGS_IPV6_128_PREFIX_LEN + 1;
+    buffer[n++] = 0xff; /* QoS rule precedence */
+    buffer[n++] = 1; /* QoS flow identifier */
+    rules.buffer = buffer;
+    rules.length = n;
+
+    /* A prefix length above 128 is rejected. */
+    if (level >= OGS_LOG_ERROR && level < OGS_LOG_DEBUG)
+        ogs_log_set_domain_level(__ogs_nas_domain, OGS_LOG_FATAL);
+    ABTS_INT_EQUAL(tc, 0, ogs_nas_parse_qos_rules(rule, &rules));
+    ogs_log_set_domain_level(__ogs_nas_domain, level);
+
+    /* The largest valid prefix length is still accepted. */
+    buffer[n-3] = OGS_IPV6_128_PREFIX_LEN;
+    ABTS_INT_EQUAL(tc, 1, ogs_nas_parse_qos_rules(rule, &rules));
+    ABTS_INT_EQUAL(tc, OGS_IPV6_128_PREFIX_LEN,
+            rule[0].pf[0].content.component[0].ipv6.prefixlen);
+}
+
+static void ogs_nas_5gs_nssai_truncated_test(abts_case *tc, void *data)
+{
+    ogs_nas_s_nssai_ie_t s_nssai[OGS_MAX_NUM_OF_SLICE];
+    ogs_nas_nssai_t nssai;
+    ogs_log_level_e level = ogs_log_get_domain_level(__ogs_nas_domain);
+
+    if (level >= OGS_LOG_ERROR && level < OGS_LOG_DEBUG)
+        ogs_log_set_domain_level(__ogs_nas_domain, OGS_LOG_FATAL);
+
+    /* S-NSSAI length says SST and SD, but only the SST is present. */
+    memset(&nssai, 0, sizeof(nssai));
+    nssai.length = 2;
+    nssai.buffer[0] = OGS_NAS_S_NSSAI_SST_AND_SD;
+    nssai.buffer[1] = 1;
+    ABTS_INT_EQUAL(tc, 0, ogs_nas_parse_nssai(s_nssai, &nssai));
+
+    /* An invalid S-NSSAI length stops parsing after the valid ones. */
+    memset(&nssai, 0, sizeof(nssai));
+    nssai.length = 6;
+    nssai.buffer[0] = OGS_NAS_S_NSSAI_SST_LEN;
+    nssai.buffer[1] = 1;
+    nssai.buffer[2] = 3;
+    ABTS_INT_EQUAL(tc, 1, ogs_nas_parse_nssai(s_nssai, &nssai));
+
+    ogs_log_set_domain_level(__ogs_nas_domain, level);
+
+    /* A well-formed NSSAI is still accepted. */
+    memset(&nssai, 0, sizeof(nssai));
+    nssai.length = 7;
+    nssai.buffer[0] = OGS_NAS_S_NSSAI_SST_LEN;
+    nssai.buffer[1] = 1;
+    nssai.buffer[2] = OGS_NAS_S_NSSAI_SST_AND_SD;
+    nssai.buffer[3] = 2;
+    nssai.buffer[4] = 0x01;
+    nssai.buffer[5] = 0x02;
+    nssai.buffer[6] = 0x03;
+    ABTS_INT_EQUAL(tc, 2, ogs_nas_parse_nssai(s_nssai, &nssai));
+    ABTS_INT_EQUAL(tc, 1, s_nssai[0].sst);
+    ABTS_INT_EQUAL(tc, 2, s_nssai[1].sst);
+    ABTS_INT_EQUAL(tc, 0x010203, s_nssai[1].sd.v);
+}
+
+static void eps_message_container_length_test(abts_case *tc, void *data)
+{
+    ogs_nas_eps_message_container_t container;
+    ogs_pkbuf_t *pkbuf;
+    int size;
+    ogs_log_level_e level = ogs_log_get_domain_level(__ogs_nas_domain);
+
+    memset(&container, 0x5a, sizeof(container));
+
+    pkbuf = ogs_pkbuf_alloc(NULL, OGS_MAX_SDU_LEN);
+    ogs_assert(pkbuf);
+    ogs_pkbuf_put(pkbuf, OGS_MAX_SDU_LEN);
+
+    container.length = OGS_NAS_MAX_MESSAGE_CONTAINER_LEN;
+    size = ogs_nas_eps_encode_eps_message_container(pkbuf, &container);
+    ABTS_INT_EQUAL(tc, OGS_NAS_MAX_MESSAGE_CONTAINER_LEN + 1, size);
+
+    /* A length beyond the buffer must be refused, not encoded. */
+    container.length = OGS_NAS_MAX_MESSAGE_CONTAINER_LEN + 1;
+    if (level >= OGS_LOG_ERROR && level < OGS_LOG_DEBUG)
+        ogs_log_set_domain_level(__ogs_nas_domain, OGS_LOG_FATAL);
+    size = ogs_nas_eps_encode_eps_message_container(pkbuf, &container);
+    ogs_log_set_domain_level(__ogs_nas_domain, level);
+    ABTS_INT_EQUAL(tc, -1, size);
+
+    ogs_pkbuf_free(pkbuf);
+}
+
 abts_suite *test_nas_message(abts_suite *suite)
 {
     suite = ADD_SUITE(suite)
 
     abts_run_test(suite, imeisv_conversion_test, NULL);
+    abts_run_test(suite, eps_message_container_length_test, NULL);
     abts_run_test(suite, ogs_nas_eps_message_test1, NULL);
     abts_run_test(suite, ogs_nas_eps_message_test2, NULL);
     abts_run_test(suite, ogs_nas_eps_message_test3, NULL);
@@ -596,6 +706,8 @@ abts_suite *test_nas_message(abts_suite *suite)
     abts_run_test(suite, ogs_nas_eps_message_test7, NULL);
     abts_run_test(suite, ogs_nas_eps_message_test8, NULL);
     abts_run_test(suite, ogs_nas_eps_message_test9, NULL);
+    abts_run_test(suite, ogs_nas_5gs_qos_rules_prefix_length_test, NULL);
+    abts_run_test(suite, ogs_nas_5gs_nssai_truncated_test, NULL);
 
     return suite;
 }

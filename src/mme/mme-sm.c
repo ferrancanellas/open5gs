@@ -267,11 +267,17 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
 
         mme_ue = mme_ue_find_by_id(enb_ue->mme_ue_id);
 
+        /* The integrity verdict of this message, checked when queued */
+        if (mme_ue) {
+            mme_ue->mac_failed = e->mac_failed;
+            e->mme_ue_id = mme_ue->id;
+        }
+
         if (mme_ue && mme_ue->attach_session_delete_pending) {
             ogs_error("[%s] NAS message while deleting old Attach sessions",
                     mme_ue->imsi_bcd);
             ogs_pkbuf_free(pkbuf);
-            return;
+            break;
         }
 
         /*
@@ -306,7 +312,7 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
          */
         if (mme_ue && MME_UE_HAVE_IMSI(mme_ue) &&
             nas_message.emm.h.message_type == OGS_NAS_EPS_ATTACH_REQUEST) {
-            mme_ue_t *attaching_ue = mme_ue_find_by_message(&nas_message);
+            mme_ue_t *attaching_ue = mme_ue_find_by_message(&nas_message, NULL);
 
             if (attaching_ue != mme_ue &&
                 (OGS_FSM_CHECK(&mme_ue->sm, emm_state_registered) ||
@@ -335,12 +341,31 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
                 mme_send_release_access_bearer_or_ue_context_release(enb_ue);
 
                 ogs_pkbuf_free(pkbuf);
-                return;
+                break;
             }
         }
 
         if (!mme_ue) {
-            mme_ue = mme_ue_find_by_message(&nas_message);
+            bool pending_guti;
+            ogs_nas_security_header_type_t h;
+
+            h.type = e->nas_type;
+            mme_ue = mme_ue_find_by_message(&nas_message, &pending_guti);
+            if (pending_guti) {
+                const ogs_nas_eps_attach_type_t *type =
+                    &nas_message.emm.attach_request.eps_attach_type;
+
+                /* Verify the pending GUTI before rebinding the S1 context.
+                 * Fall back to identification if the context cannot be used. */
+                if (!h.integrity_protected ||
+                    !SECURITY_CONTEXT_IS_VALID(mme_ue) ||
+                    mme_ue->selected_int_algorithm ==
+                        OGS_NAS_SECURITY_ALGORITHMS_EIA0 ||
+                    !emm_check_ksi(mme_ue, type->tsc,
+                        type->nas_key_set_identifier))
+                    mme_ue = NULL;
+            }
+
             if (!mme_ue) {
                 mme_ue = mme_ue_add(enb_ue);
                 if (mme_ue == NULL) {
@@ -351,7 +376,7 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
                     ogs_expect(r == OGS_OK);
                     ogs_assert(r != OGS_ERROR);
                     ogs_pkbuf_free(pkbuf);
-                    return;
+                    break;
                 }
 
                 ogs_assert(ECM_IDLE(mme_ue));
@@ -365,7 +390,7 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
                     ogs_expect(r == OGS_OK);
                     ogs_assert(r != OGS_ERROR);
                     ogs_pkbuf_free(pkbuf);
-                    return;
+                    break;
                 }
                 /* Here, if the MME_UE Context is found,
                  * the integrity check is not performed
@@ -373,17 +398,27 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
                  * TRACKING_AREA_UPDATE_REQUEST message
                  *
                  * Now, We will check the MAC in the NAS message*/
-                ogs_nas_security_header_type_t h;
-                h.type = e->nas_type;
                 if (h.integrity_protected) {
                     /* Decryption was performed in S1AP handler.
                      * So, we disabled 'ciphered'
                      * not to decrypt NAS message */
                     h.ciphered = 0;
-                    if (nas_eps_security_decode(mme_ue, h, pkbuf) != OGS_OK) {
-                        ogs_error("nas_security_decode() failed");
+                    if (nas_eps_security_decode(mme_ue, h, pkbuf) != OGS_OK ||
+                        (pending_guti && mme_ue->mac_failed)) {
+                        ogs_warn("nas_security_decode() failed");
+                        /* The message is discarded with its verdict */
+                        mme_ue->mac_failed = 0;
+                        if (pending_guti) {
+                            /* Verification did not authorize rebinding. */
+                            r = s1ap_send_ue_context_release_command(enb_ue,
+                                    S1AP_Cause_PR_nas,
+                                    S1AP_CauseNas_normal_release,
+                                    S1AP_UE_CTX_REL_S1_CONTEXT_REMOVE, 0);
+                            if (r != OGS_OK)
+                                enb_ue_remove(enb_ue);
+                        }
                         ogs_pkbuf_free(pkbuf);
-                        return;
+                        break;
                     }
                 }
 
@@ -451,11 +486,25 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
         break;
 
     case MME_EVENT_ESM_MESSAGE:
-        mme_ue = mme_ue_find_by_id(e->mme_ue_id);
-        ogs_assert(mme_ue);
-
+        /*
+         * Standalone NAS ESM and ESM carried in an EMM container share this
+         * queue. EMM is per UE (mme_ue->sm); ESM is per bearer (bearer->sm).
+         * ESM events are dispatched directly to the bearer, not the EMM FSM.
+         *
+         * Recheck the UE and its current EMM state when consuming the event:
+         * ULA can queue the saved Attach PDN request, then Detach can run
+         * before that ESM event. Validate before session/bearer lookup,
+         * which can create a session or change an existing session's PTI.
+         */
         pkbuf = e->pkbuf;
         ogs_assert(pkbuf);
+
+        mme_ue = mme_ue_find_by_id(e->mme_ue_id);
+        if (!mme_ue) {
+            ogs_error("MME-UE Context has already been removed");
+            ogs_pkbuf_free(pkbuf);
+            break;
+        }
         if (mme_ue->attach_session_delete_pending || mme_ue->eir_check_pending) {
             ogs_error("[%s] ESM message while "
                     "checking EIR or deleting sessions", mme_ue->imsi_bcd);
@@ -468,99 +517,44 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
             break;
         }
 
-#define ESM_MESSAGE_CHECK \
-    do { \
-        ogs_error("emm_state_exception"); \
-        ogs_error("nas_type:%d, create_action:%d", \
-                e->nas_type, e->create_action); \
-        ogs_error("esm.message[EBI:%d,PTI:%d,TYPE:%d]", \
-                nas_message.esm.h.eps_bearer_identity, \
-                nas_message.esm.h.procedure_transaction_identity, \
-                nas_message.esm.h.message_type); \
-    } while(0)
-
-    /*
-     * Because a race condition can occur between S6A Diameter and S1AP message,
-     * the following error handling code has been added.
-     *
-     * 1. InitialUEMessage + Attach Request + PDN Connectivity request
-     * 2. Authentication-Information-Request/Authentication-Information-Answer
-     * 3. Authentication Request/Response
-     * 4. Security-mode command/complete
-     * 5. Update-Location-Request/Update-Location-Answer
-     * 6. Detach request/accept
-     *
-     * In the ULR/ULA process in step 6, the PDN Connectivity request is
-     * pushed to the queue as an ESM_MESSAGE because the NAS-Type is still
-     * an Attach Request.
-     *
-     * See the code below in 'mme-s6a-handler.c' for where the queue is pushed.
-     *
-     *   if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST) {
-     *       rv = nas_eps_send_emm_to_esm(mme_ue,
-     *               &mme_ue->pdn_connectivity_request);
-     *       if (rv != OGS_OK) {
-     *           ogs_error("nas_eps_send_emm_to_esm() failed");
-     *           return OGS_NAS_EMM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED;
-     *       }
-     *   } else if (mme_ue->nas_eps.type == MME_EPS_TYPE_TAU_REQUEST) {
-     *       r = nas_eps_send_tau_accept(mme_ue,
-     *               S1AP_ProcedureCode_id_InitialContextSetup);
-     *       ogs_expect(r == OGS_OK);
-     *       ogs_assert(r != OGS_ERROR);
-     *   } else {
-     *       ogs_error("Invalid Type[%d]", mme_ue->nas_eps.type);
-     *       return OGS_NAS_EMM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED;
-     *   }
-     *
-     * If you perform step 7 Detach request/accept here,
-     * the NAS-Type becomes Detach Request and the EMM state changes
-     * to emm_state_de_registered().
-     *
-     * Since the PDN, which is an ESM message that was previously queued,
-     * should not be processed in de_registered, the message is ignored
-     * through error handling below.
-     *
-     * Otherwise, MME will crash because there is no active bearer
-     * in the initial_context_setup_request build process.
-     *
-     * See the code below in 's1ap-build.c' for where the crash occurs.
-     *   ogs_list_for_each(&mme_ue->sess_list, sess) {
-     *       ogs_list_for_each(&sess->bearer_list, bearer) {
-     *           ...
-     *           if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST) {
-     *           } else if (OGS_FSM_CHECK(&bearer->sm, esm_state_inactive)) {
-     *               ogs_warn("No active EPS bearer [%d]", bearer->ebi);
-     *               ogs_warn("    IMSI[%s] NAS-EPS Type[%d] "
-     *                       "ENB_UE_S1AP_ID[%d] MME_UE_S1AP_ID[%d]",
-     *                       mme_ue->imsi_bcd, mme_ue->nas_eps.type,
-     *                       enb_ue->enb_ue_s1ap_id, enb_ue->mme_ue_s1ap_id);
-     *               continue;
-     *           }
-     *           ...
-     *       }
-     *   }
-     */
-        if (OGS_FSM_CHECK(&mme_ue->sm, emm_state_de_registered)) {
-            ESM_MESSAGE_CHECK;
-            ogs_pkbuf_free(pkbuf);
-            break;
-        } else if (OGS_FSM_CHECK(&mme_ue->sm, emm_state_authentication)) {
-            ESM_MESSAGE_CHECK;
-            ogs_pkbuf_free(pkbuf);
-            break;
-        } else if (OGS_FSM_CHECK(&mme_ue->sm, emm_state_security_mode)) {
-            ESM_MESSAGE_CHECK;
-            ogs_pkbuf_free(pkbuf);
-            break;
-        } else if (OGS_FSM_CHECK(&mme_ue->sm, emm_state_initial_context_setup)) {
-        } else if (OGS_FSM_CHECK(&mme_ue->sm, emm_state_registered)) {
-        } else if (OGS_FSM_CHECK(&mme_ue->sm, emm_state_exception)) {
-            ESM_MESSAGE_CHECK;
+        /* Only INITIAL_CONTEXT_SETUP and REGISTERED may accept ESM messages. */
+        if (OGS_FSM_CHECK(&mme_ue->sm, emm_state_initial_context_setup)) {
+            /*
+             * During Attach, this EMM state covers the work after NAS
+             * security is ready: EIR/HSS waits, ESM information exchange,
+             * session creation, and waiting for Attach Complete. It is not
+             * limited to the S1AP Initial Context Setup exchange. TAU also
+             * uses this state; EIR/session-deletion waits are checked above.
+             *
+             * Attach Accept requires one session. Allow the PDN request
+             * saved from Attach Request (ATTACH action), but drop a
+             * standalone PDN request (UPLINK action) until Attach completes.
+             * Other ESM messages, e.g. ESM Information Response, still pass.
+             */
+            if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST &&
+                e->create_action == OGS_GTP_CREATE_IN_UPLINK_NAS_TRANSPORT &&
+                nas_message.esm.h.message_type ==
+                    OGS_NAS_EPS_PDN_CONNECTIVITY_REQUEST) {
+                ogs_error("[%s] PDN Connectivity Request during Attach",
+                        mme_ue->imsi_bcd);
+                ogs_pkbuf_free(pkbuf);
+                break;
+            }
+        } else if (!OGS_FSM_CHECK(&mme_ue->sm, emm_state_registered)) {
+            /* No ESM in identity/authentication/security setup or release. */
+            ogs_error("[%s] ESM message not allowed in current EMM state",
+                    mme_ue->imsi_bcd);
+            ogs_error("nas_type:%d, create_action:%d",
+                    e->nas_type, e->create_action);
+            ogs_error("esm.message[EBI:%d,PTI:%d,TYPE:%d]",
+                    nas_message.esm.h.eps_bearer_identity,
+                    nas_message.esm.h.procedure_transaction_identity,
+                    nas_message.esm.h.message_type);
             ogs_pkbuf_free(pkbuf);
             break;
         }
 
+        /* Lookup may now create or update session/bearer context. */
         bearer = mme_bearer_find_or_add_by_message(
                     mme_ue, &nas_message, e->create_action);
         if (!bearer) {
@@ -576,7 +570,10 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
         e->bearer_id = bearer->id;
         e->nas_message = &nas_message;
 
+        /* Dispatch the admitted message to the selected bearer's ESM FSM. */
+        mme_ue->mac_failed = e->mac_failed;
         ogs_fsm_dispatch(&bearer->sm, e);
+        mme_ue->mac_failed = 0;
         if (OGS_FSM_CHECK(&bearer->sm, esm_state_bearer_deactivated)) {
             if (default_bearer->ebi == bearer->ebi) {
                 /* if the bearer is a default bearer,
@@ -609,6 +606,7 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
         break;
 
     case MME_EVENT_ESM_TIMER:
+        /* Timers already identify a bearer; they never create a session. */
         bearer = mme_bearer_find_by_id(e->bearer_id);
         if (!bearer) {
             ogs_error("Bearer Context has already been removed");
@@ -1195,5 +1193,12 @@ cleanup:
     default:
         ogs_error("No handler for event %s", mme_event_get_name(e));
         break;
+    }
+
+    /* The verdict was that of this NAS message only, whatever its fate */
+    if (e->id == MME_EVENT_EMM_MESSAGE) {
+        mme_ue = mme_ue_find_by_id(e->mme_ue_id);
+        if (mme_ue)
+            mme_ue->mac_failed = 0;
     }
 }

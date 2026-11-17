@@ -1288,6 +1288,8 @@ typedef enum {
 sgw_relocation_e sgw_ue_check_if_relocated(mme_ue_t *mme_ue);
 
 void mme_ue_new_guti(mme_ue_t *mme_ue);
+void mme_ue_publish_next_guti(mme_ue_t *mme_ue);
+void mme_ue_unpublish_next_guti(mme_ue_t *mme_ue);
 void mme_ue_confirm_guti(mme_ue_t *mme_ue);
 
 #define INVALID_P_TMSI 0
@@ -1310,7 +1312,8 @@ mme_ue_t *mme_ue_find_by_guti(const ogs_nas_eps_guti_t *nas_guti);
 mme_ue_t *mme_ue_find_by_s11_local_teid(uint32_t teid);
 mme_ue_t *mme_ue_find_by_gn_local_teid(uint32_t teid);
 
-mme_ue_t *mme_ue_find_by_message(const ogs_nas_eps_message_t *message);
+mme_ue_t *mme_ue_find_by_message(
+        const ogs_nas_eps_message_t *message, bool *pending_guti);
 
 /* Which procedure supplied the IMSI - logged at the OLD UE context
  * migration, so we can tell which callers actually reach it. */
@@ -1318,6 +1321,7 @@ typedef enum {
     MME_UE_IMSI_FROM_ATTACH_REQUEST = 0,
     MME_UE_IMSI_FROM_IDENTITY_RESPONSE,
     MME_UE_IMSI_FROM_SGSN_CONTEXT_RESPONSE,
+    MME_UE_IMSI_FROM_AUTHENTICATION_RESPONSE,
 } mme_ue_imsi_source_e;
 
 int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd,

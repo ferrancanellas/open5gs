@@ -3765,6 +3765,28 @@ void mme_ue_new_guti(mme_ue_t *mme_ue)
     mme_ue->next.guti.m_tmsi = *(mme_ue->next.m_tmsi);
 }
 
+void mme_ue_publish_next_guti(mme_ue_t *mme_ue)
+{
+    ogs_assert(MME_NEXT_GUTI_IS_AVAILABLE(mme_ue));
+
+    if (ogs_hash_get(self.guti_ue_hash,
+            &mme_ue->next.guti, sizeof(mme_ue->next.guti)) == mme_ue)
+        return;
+
+    ogs_hash_set(self.guti_ue_hash,
+            &mme_ue->next.guti, sizeof(mme_ue->next.guti), mme_ue);
+    ogs_info("[%s] Pending GUTI[G:%d,C:%d,M_TMSI:0x%x]",
+            mme_ue->imsi_bcd, mme_ue->next.guti.mme_gid,
+            mme_ue->next.guti.mme_code, mme_ue->next.guti.m_tmsi);
+}
+
+void mme_ue_unpublish_next_guti(mme_ue_t *mme_ue)
+{
+    if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue))
+        ogs_hash_unset_if_owner(self.guti_ue_hash,
+                &mme_ue->next.guti, sizeof(mme_ue->next.guti), mme_ue);
+}
+
 void mme_ue_confirm_guti(mme_ue_t *mme_ue)
 {
     ogs_assert(MME_NEXT_GUTI_IS_AVAILABLE(mme_ue));
@@ -4056,6 +4078,7 @@ void mme_ue_remove(mme_ue_t *mme_ue)
     }
 
     if (MME_NEXT_GUTI_IS_AVAILABLE(mme_ue)) {
+        mme_ue_unpublish_next_guti(mme_ue);
         ogs_assert(mme_m_tmsi_free(mme_ue->next.m_tmsi) == OGS_OK);
     }
 
@@ -4159,12 +4182,30 @@ mme_ue_t *mme_ue_find_by_imsi(const uint8_t *imsi, int imsi_len)
     return (mme_ue_t *)ogs_hash_get(self.imsi_ue_hash, imsi, imsi_len);
 }
 
-mme_ue_t *mme_ue_find_by_guti(const ogs_nas_eps_guti_t *guti)
+static mme_ue_t *find_ue_by_guti(
+        const ogs_nas_eps_guti_t *guti, bool allow_pending, bool *pending_guti)
 {
+    mme_ue_t *mme_ue = NULL;
+
     ogs_assert(guti);
 
-    return (mme_ue_t *)ogs_hash_get(
-            self.guti_ue_hash, guti, sizeof(ogs_nas_eps_guti_t));
+    mme_ue = ogs_hash_get(self.guti_ue_hash, guti, sizeof(*guti));
+    if (!mme_ue || (MME_CURRENT_GUTI_IS_AVAILABLE(mme_ue) &&
+            memcmp(guti, &mme_ue->current.guti, sizeof(*guti)) == 0))
+        return mme_ue;
+
+    /* Only a NAS Attach Request may look up a pending GUTI. */
+    if (!allow_pending)
+        return NULL;
+
+    if (pending_guti)
+        *pending_guti = true;
+    return mme_ue;
+}
+
+mme_ue_t *mme_ue_find_by_guti(const ogs_nas_eps_guti_t *guti)
+{
+    return find_ue_by_guti(guti, false, NULL);
 }
 
 mme_ue_t *mme_ue_find_by_s11_local_teid(uint32_t teid)
@@ -4177,7 +4218,8 @@ mme_ue_t *mme_ue_find_by_gn_local_teid(uint32_t teid)
     return ogs_hash_get(self.mme_gn_teid_hash, &teid, sizeof(teid));
 }
 
-mme_ue_t *mme_ue_find_by_message(const ogs_nas_eps_message_t *message)
+mme_ue_t *mme_ue_find_by_message(
+        const ogs_nas_eps_message_t *message, bool *pending_guti)
 {
     mme_ue_t *mme_ue = NULL;
     const ogs_nas_eps_attach_request_t *attach_request = NULL;
@@ -4192,6 +4234,9 @@ mme_ue_t *mme_ue_find_by_message(const ogs_nas_eps_message_t *message)
     const ogs_nas_mobile_identity_tmsi_t *mobile_identity_tmsi = NULL;
     const served_gummei_t *served_gummei = NULL;
     ogs_nas_eps_guti_t ogs_nas_guti;
+
+    if (pending_guti)
+        *pending_guti = false;
 
     switch (message->emm.h.message_type) {
     case OGS_NAS_EPS_ATTACH_REQUEST:
@@ -4226,7 +4271,7 @@ mme_ue_t *mme_ue_find_by_message(const ogs_nas_eps_message_t *message)
             ogs_nas_guti.mme_code = eps_mobile_identity_guti->mme_code;
             ogs_nas_guti.m_tmsi = eps_mobile_identity_guti->m_tmsi;
 
-            mme_ue = mme_ue_find_by_guti(&ogs_nas_guti);
+            mme_ue = find_ue_by_guti(&ogs_nas_guti, true, pending_guti);
             if (mme_ue) {
                 ogs_info("[%s] Known UE by GUTI[G:%d,C:%d,M_TMSI:0x%x]",
                         mme_ue->imsi_bcd,
@@ -4360,6 +4405,8 @@ static const char *mme_ue_imsi_source_name(mme_ue_imsi_source_e source)
         return "IDENTITY_RESPONSE";
     case MME_UE_IMSI_FROM_SGSN_CONTEXT_RESPONSE:
         return "SGSN_CONTEXT_RESPONSE";
+    case MME_UE_IMSI_FROM_AUTHENTICATION_RESPONSE:
+        return "AUTHENTICATION_RESPONSE";
     }
     return "UNKNOWN";
 }
@@ -4430,6 +4477,15 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd,
 
     /* Check if OLD mme_ue_t is existed */
     old_mme_ue = mme_ue_find_by_imsi(mme_ue->imsi, mme_ue->imsi_len);
+    if (old_mme_ue && (source == MME_UE_IMSI_FROM_ATTACH_REQUEST ||
+                source == MME_UE_IMSI_FROM_IDENTITY_RESPONSE)) {
+        /*
+         * The IMSI is not authenticated yet: the context that has it keeps
+         * it, and its sessions, until this one is. The Authentication
+         * Response calls this function again (TS 24.301 5.5.1.2.7 f)).
+         */
+        old_mme_ue = NULL;
+    }
     if (old_mme_ue) {
         /* Check if OLD mme_ue_t is different with NEW mme_ue_t */
         if (ogs_pool_index(&mme_ue_pool, mme_ue) !=
@@ -4596,9 +4652,12 @@ int mme_ue_set_imsi(mme_ue_t *mme_ue, char *imsi_bcd,
         }
     }
 
-    /* Register new IMSI in hash.
+    /* Register new IMSI in hash, unless another context keeps it.
      * Old IMSI hash entry was already removed at the top of this function. */
-    ogs_hash_set(self.imsi_ue_hash, mme_ue->imsi, mme_ue->imsi_len, mme_ue);
+    old_mme_ue = mme_ue_find_by_imsi(mme_ue->imsi, mme_ue->imsi_len);
+    if (!old_mme_ue || old_mme_ue == mme_ue)
+        ogs_hash_set(self.imsi_ue_hash,
+                mme_ue->imsi, mme_ue->imsi_len, mme_ue);
 
     mme_ue->hssmap = mme_hssmap_find_by_imsi_bcd(mme_ue->imsi_bcd);
     if (mme_ue->hssmap) {
@@ -5236,6 +5295,25 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
             "ESM message type:%d, PTI:%d, EBI:%d",
             message->esm.h.message_type, pti, ebi);
 
+    /*
+     * TS 24.301 7.3.2: a PDN DISCONNECT REQUEST carries no EPS bearer
+     * identity in its ESM header.  Checking it here, before the generic
+     * non-zero-EBI lookup below returns the named bearer, keeps an
+     * assigned or reserved header EBI (6.5.2.6 a) from selecting the
+     * default or a dedicated bearer and dispatching the disconnect on it.
+     */
+    if (message->esm.h.message_type == OGS_NAS_EPS_PDN_DISCONNECT_REQUEST &&
+            ebi != OGS_NAS_EPS_BEARER_IDENTITY_UNASSIGNED) {
+        ogs_error("PDN disconnect with EBI[%d] in the ESM header", ebi);
+        if (pti != OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED) {
+            r = nas_eps_send_pdn_disconnect_reject(mme_ue, pti,
+                    OGS_NAS_ESM_CAUSE_INVALID_EPS_BEARER_IDENTITY);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+        }
+        return NULL;
+    }
+
     if (ebi != OGS_NAS_EPS_BEARER_IDENTITY_UNASSIGNED) {
         bearer = mme_bearer_find_by_ue_ebi(mme_ue, ebi);
         if (!bearer) {
@@ -5273,9 +5351,26 @@ mme_bearer_t *mme_bearer_find_or_add_by_message(
         if (!bearer) {
             ogs_error("No Bearer : Linked-EBI[%d]",
                     linked_eps_bearer_identity->eps_bearer_identity);
-            r = nas_eps_send_attach_reject(enb_ue, mme_ue,
-                    OGS_NAS_EMM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED,
-                    OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
+            r = nas_eps_send_pdn_disconnect_reject(mme_ue, pti,
+                    OGS_NAS_ESM_CAUSE_INVALID_EPS_BEARER_IDENTITY);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+            return NULL;
+        }
+
+        /*
+         * TS 24.301 6.5.2.2: the Linked EBI of a PDN DISCONNECT REQUEST
+         * identifies the default bearer of the PDN connection.  A dedicated
+         * bearer here is an invalid EPS bearer identity and 6.5.2.6 says to
+         * answer with PDN DISCONNECT REJECT cause #43, not to dispatch the
+         * disconnect on the dedicated bearer's ESM state machine.
+         */
+        sess = mme_sess_find_by_id(bearer->sess_id);
+        if (!sess || mme_default_bearer_in_sess(sess) != bearer) {
+            ogs_error("PDN disconnect for non-default Linked-EBI[%d]",
+                    linked_eps_bearer_identity->eps_bearer_identity);
+            r = nas_eps_send_pdn_disconnect_reject(mme_ue, pti,
+                    OGS_NAS_ESM_CAUSE_INVALID_EPS_BEARER_IDENTITY);
             ogs_expect(r == OGS_OK);
             ogs_assert(r != OGS_ERROR);
             return NULL;
